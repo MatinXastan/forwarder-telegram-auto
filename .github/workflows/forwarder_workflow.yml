@@ -1,0 +1,90 @@
+name: Telegram Post Forwarder
+
+on:
+  workflow_dispatch:
+  schedule:
+    # هر ۱۰ دقیقه یک بار اجرا می‌شود
+    - cron: '*/10 * * * *'
+
+jobs:
+  run-forwarder-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Action Repo
+        uses: actions/checkout@v4
+
+      - name: Checkout State Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.STATE_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: state-repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Read state and select next channel
+        id: state
+        run: |
+          STATE_FILE="state-repo/forwarder_state.json"
+          
+          if [ ! -f "$STATE_FILE" ]; then
+            echo '{"next_channel_index": 0}' > $STATE_FILE
+          fi
+          
+          INDEX=$(jq '.next_channel_index' $STATE_FILE)
+          
+          IFS=',' read -r -a sources <<< "${{ vars.SOURCE_CHANNELS_LIST }}"
+          IFS=',' read -r -a destinations <<< "${{ vars.DESTINATION_CHANNELS_LIST }}"
+          
+          NUM_CHANNELS=${#sources[@]}
+          
+          if [ $NUM_CHANNELS -eq 0 ]; then
+            echo "Error: No channels defined in repository variables."
+            exit 1
+          fi
+
+          CURRENT_SOURCE=$(echo "${sources[$INDEX]}" | xargs)
+          CURRENT_DESTINATION=$(echo "${destinations[$INDEX]}" | xargs)
+          
+          echo "Processing pair $INDEX: $CURRENT_SOURCE -> $CURRENT_DESTINATION"
+          
+          echo "SOURCE_CHANNEL=$CURRENT_SOURCE" >> $GITHUB_ENV
+          echo "DESTINATION_CHANNEL=$CURRENT_DESTINATION" >> $GITHUB_ENV
+          
+          NEW_INDEX=$(( (INDEX + 1) % NUM_CHANNELS ))
+          echo "Next index will be $NEW_INDEX"
+          jq ".next_channel_index = $NEW_INDEX" $STATE_FILE > tmp.json && mv tmp.json $STATE_FILE
+
+      - name: Run Python Forwarder Script
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TELETHON_SESSION: ${{ secrets.TELETHON_SESSION }}
+          SOURCE_CHANNEL: ${{ env.SOURCE_CHANNEL }}
+          DESTINATION_CHANNEL: ${{ env.DESTINATION_CHANNEL }}
+        run: python forwarder.py
+
+      - name: Commit and Push State File
+        run: |
+          cd state-repo
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add forwarder_state.json
+          if git diff-index --quiet HEAD; then
+            echo "No changes to commit in state repo."
+          else
+            git commit -m "Update forwarder state"
+            git pull --rebase
+            git push
+          fi
+
