@@ -1,123 +1,136 @@
 import os
 import asyncio
+import json
 import re
-import sys
-import logging
-from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
+import logging
+from datetime import datetime, timedelta, timezone
+import sys
 
-# --- خواندن تنظیمات از متغیرهای محیطی ---
+# --- ۱. خواندن تنظیمات از متغیرهای محیطی ---
 API_ID = int(os.environ.get('API_ID'))
 API_HASH = os.environ.get('API_HASH')
 TELETHON_SESSION = os.environ.get('TELETHON_SESSION')
+STATE_REPO_PATH = 'state-repo'
+STATE_FILE_PATH = os.path.join(STATE_REPO_PATH, "forwarder_state.json")
+HOURS_OF_INACTIVITY = 4 # ساعت عدم فعالیت برای ارسال پست
 
-# این متغیرها توسط GitHub Action برای هر اجرا تنظیم می‌شوند
-SOURCE_CHANNEL = os.environ.get('SOURCE_CHANNEL')
-DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
-
-# --- تنظیمات محلی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-CHECK_INTERVAL_HOURS = 4 # فاصله زمانی برای بررسی (۴ ساعت)
-MESSAGES_TO_CHECK = 5 # تعداد آخرین پیام‌ها برای بررسی در کانال مبدأ
 
-def clean_and_validate_message(message, source_channel_username):
-    """
-    پست را برای لینک‌ها و منشن‌های خارجی بررسی می‌کند.
-    در صورت معتبر بودن، متن پاک‌سازی شده را برمی‌گرداند.
-    در غیر این صورت None را برمی‌گرداند.
-    """
-    if not message:
+def read_json_file(file_path, default_content=None):
+    """یک فایل JSON را می‌خواند یا در صورت عدم وجود، محتوای پیش‌فرض را ایجاد می‌کند."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        if default_content is not None:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            write_json_file(file_path, default_content)
+            return default_content
         return None
 
-    text = message.text or ""
-    
-    # ۱. بررسی وجود لینک
+def write_json_file(file_path, data):
+    """داده را در یک فایل JSON می‌نویسد."""
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+async def clean_and_validate_message(message, source_channel_username):
+    """یک پیام را برای ارسال بررسی و پاک‌سازی می‌کند."""
+    # --- رفع باگ ---
+    # یک بررسی ایمنی اضافه شده تا از خطا در صورت None بودن متغیر جلوگیری شود
+    if not source_channel_username:
+        logging.error("تابع clean_and_validate_message با یک نام کاربری کانال مبدأ نامعتبر فراخوانی شد.")
+        return None
+
+    text = message.text
+    if not text:
+        return None  # پیام‌های بدون متن را نادیده می‌گیریم
+
+    # ۱. نام کاربری کانال مبدأ را برای مقایسه تمیز می‌کنیم
+    source_username_clean = source_channel_username.lstrip('@')
+
+    # ۲. بررسی وجود لینک در متن
     url_pattern = r'https?://\S+|www\.\S+|t\.me/\S+'
     if re.search(url_pattern, text):
-        logging.warning(f"Skipping post {message.id} from {source_channel_username}: Contains a link.")
+        logging.warning(f"پست {message.id} حاوی لینک بود. از آن صرف‌نظر می‌شود.")
         return None
 
-    # ۲. بررسی منشن‌های خارجی
+    # ۳. بررسی منشن‌های خارجی
     mention_pattern = r'@(\w+)'
     mentions = re.findall(mention_pattern, text)
-    source_username_clean = source_channel_username.lstrip('@')
     for mention in mentions:
         if mention.lower() != source_username_clean.lower():
-            logging.warning(f"Skipping post {message.id} from {source_channel_username}: Contains an external mention @{mention}.")
+            logging.warning(f"پست {message.id} حاوی منشن خارجی @{mention} بود. از آن صرف‌نظر می‌شود.")
             return None
-            
-    # ۳. پاک‌سازی متن از آیدی کانال مبدأ (اگر وجود داشته باشد)
-    cleaned_text = re.sub(fr'@{source_username_clean}', '', text, flags=re.IGNORECASE).strip()
+
+    # ۴. پاک‌سازی متن نهایی: حذف آیدی کانال مبدأ
+    # از re.sub برای جایگزینی بدون توجه به حروف بزرگ و کوچک استفاده می‌کنیم
+    cleaned_text = re.sub(r'@' + re.escape(source_username_clean), '', text, flags=re.IGNORECASE).strip()
     return cleaned_text
 
-
 async def main():
-    if not all([API_ID, API_HASH, TELETHON_SESSION, SOURCE_CHANNEL, DESTINATION_CHANNEL]):
-        logging.error("One or more required environment variables are not set.")
+    """منطق اصلی ربات."""
+    state_data = read_json_file(STATE_FILE_PATH, default_content={"last_processed_index": -1})
+
+    source_channels = [ch.strip() for ch in os.environ.get('SOURCE_CHANNELS_LIST', '').split(',') if ch.strip()]
+    dest_channels = [ch.strip() for ch in os.environ.get('DESTINATION_CHANNELS_LIST', '').split(',') if ch.strip()]
+
+    if not source_channels or not dest_channels or len(source_channels) != len(dest_channels):
+        logging.error("لیست کانال‌های مبدأ یا مقصد به درستی تنظیم نشده‌اند.")
         sys.exit(1)
+
+    # تعیین اینکه کدام جفت کانال باید پردازش شود
+    num_channels = len(source_channels)
+    current_index = state_data.get('last_processed_index', -1)
+    next_index = (current_index + 1) % num_channels
+
+    source_channel = source_channels[next_index]
+    destination_channel = dest_channels[next_index]
+
+    logging.info(f"پردازش جفت کانال: {source_channel} -> {destination_channel}")
 
     client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
 
     try:
         await client.connect()
-        logging.info(f"Telegram client connected. Processing: {SOURCE_CHANNEL} -> {DESTINATION_CHANNEL}")
+        logging.info("کلاینت تلگرام با موفقیت متصل شد.")
 
-        # ۱. بررسی کانال مقصد
-        dest_entity = await client.get_entity(DESTINATION_CHANNEL)
-        last_messages = await client.get_messages(dest_entity, limit=1)
-        
-        if last_messages:
-            last_message_date = last_messages[0].date
-            time_since_last_post = datetime.now(timezone.utc) - last_message_date
-            if time_since_last_post < timedelta(hours=CHECK_INTERVAL_HOURS):
-                logging.info(f"Last post in {DESTINATION_CHANNEL} was less than {CHECK_INTERVAL_HOURS} hours ago. No action needed.")
-                return
+        # بررسی آخرین پیام در کانال مقصد
+        last_message = await client.get_messages(destination_channel, limit=1)
+        if last_message:
+            last_post_time = last_message[0].date
+            time_since_last_post = datetime.now(timezone.utc) - last_post_time
+            if time_since_last_post < timedelta(hours=HOURS_OF_INACTIVITY):
+                logging.info(f"کانال {destination_channel} به تازگی فعال بوده است. نیازی به ارسال پست نیست.")
+                return  # خروج از برنامه
 
-        logging.info(f"No activity in {DESTINATION_CHANNEL} for the last {CHECK_INTERVAL_HOURS} hours. Checking source channel...")
+        logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال بررسی کانال مبدأ...")
 
-        # ۲. پیدا کردن پست معتبر از کانال مبدأ
-        source_entity = await client.get_entity(SOURCE_CHANNEL)
-        source_username = getattr(source_entity, 'username', SOURCE_CHANNEL)
-        
-        messages = await client.get_messages(source_entity, limit=MESSAGES_TO_CHECK)
+        # جستجو برای یک پست معتبر در کانال مبدأ
+        async for message in client.iter_messages(source_channel, limit=10):
+            if not message:
+                continue
 
-        post_to_forward = None
-        cleaned_caption = ""
+            cleaned_text = await clean_and_validate_message(message, source_channel)
+            if cleaned_text:
+                final_text = f"{cleaned_text}\n\n{destination_channel}"
+                await client.send_message(destination_channel, final_text)
+                logging.info(f"پست {message.id} با موفقیت به {destination_channel} ارسال شد.")
+                break  # پس از یافتن اولین پست معتبر، از حلقه خارج شو
+        else:
+            logging.warning(f"هیچ پست معتبری در ۱۰ پیام اخیر {source_channel} یافت نشد.")
 
-        for message in messages:
-            cleaned_text = clean_and_validate_message(message, source_username)
-            if cleaned_text is not None:
-                post_to_forward = message
-                cleaned_caption = cleaned_text
-                logging.info(f"Found a valid post to forward: ID {message.id} from {SOURCE_CHANNEL}.")
-                break
-        
-        if not post_to_forward:
-            logging.warning(f"No valid posts found in the last {MESSAGES_TO_CHECK} messages of {SOURCE_CHANNEL}. Exiting.")
-            return
-
-        # ۳. آماده‌سازی و ارسال پست
-        # آیدی کانال مقصد به صورت خودکار به انتهای پست اضافه می‌شود
-        final_caption = f"{cleaned_caption}\n\n{DESTINATION_CHANNEL}".strip()
-
-        await client.send_file(
-            dest_entity,
-            file=post_to_forward.media,
-            caption=final_caption
-        )
-        logging.info(f"Successfully forwarded post {post_to_forward.id} to {DESTINATION_CHANNEL}.")
-
-    except FloodWaitError as e:
-        logging.error(f"Flood wait error: sleeping for {e.seconds} seconds.")
-        await asyncio.sleep(e.seconds)
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
+        logging.error(f"یک خطای غیرمنتظره رخ داد: {e}", exc_info=True)
     finally:
         if client.is_connected():
             await client.disconnect()
-            logging.info("Telegram client disconnected.")
+            logging.info("کلاینت تلگرام قطع شد.")
+        # به‌روزرسانی وضعیت برای اجرای بعدی
+        state_data['last_processed_index'] = next_index
+        write_json_file(STATE_FILE_PATH, state_data)
 
 if __name__ == "__main__":
     asyncio.run(main())
