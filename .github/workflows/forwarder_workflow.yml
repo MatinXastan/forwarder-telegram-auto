@@ -3,8 +3,7 @@ name: Telegram Post Forwarder
 on:
   workflow_dispatch:
   schedule:
-    # هر ۱۰ دقیقه یک بار اجرا می‌شود
-    - cron: '*/10 * * * *'
+    - cron: '*/10 * * * *' # هر ۱۰ دقیقه یک بار اجرا می‌شود
 
 jobs:
   run-forwarder-script:
@@ -13,13 +12,6 @@ jobs:
     steps:
       - name: Checkout Action Repo
         uses: actions/checkout@v4
-
-      - name: Checkout State Repo
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.STATE_REPO }}
-          token: ${{ secrets.GH_PAT }}
-          path: state-repo
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,48 +22,33 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Checkout State Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.STATE_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: state-repo
 
       - name: Read state and select next channel
-        id: state
+        id: state_reader
         run: |
-          STATE_FILE="state-repo/forwarder_state.json"
-          
-          if [ ! -f "$STATE_FILE" ]; then
-            echo '{"next_channel_index": 0}' > $STATE_FILE
+          # این مرحله اطمینان می‌دهد که فایل وضعیت وجود دارد
+          if [ ! -f "state-repo/forwarder_state.json" ]; then
+            echo '{"last_processed_index": -1}' > state-repo/forwarder_state.json
           fi
-          
-          INDEX=$(jq '.next_channel_index' $STATE_FILE)
-          
-          IFS=',' read -r -a sources <<< "${{ vars.SOURCE_CHANNELS_LIST }}"
-          IFS=',' read -r -a destinations <<< "${{ vars.DESTINATION_CHANNELS_LIST }}"
-          
-          NUM_CHANNELS=${#sources[@]}
-          
-          if [ $NUM_CHANNELS -eq 0 ]; then
-            echo "Error: No channels defined in repository variables."
-            exit 1
-          fi
-
-          CURRENT_SOURCE=$(echo "${sources[$INDEX]}" | xargs)
-          CURRENT_DESTINATION=$(echo "${destinations[$INDEX]}" | xargs)
-          
-          echo "Processing pair $INDEX: $CURRENT_SOURCE -> $CURRENT_DESTINATION"
-          
-          echo "SOURCE_CHANNEL=$CURRENT_SOURCE" >> $GITHUB_ENV
-          echo "DESTINATION_CHANNEL=$CURRENT_DESTINATION" >> $GITHUB_ENV
-          
-          NEW_INDEX=$(( (INDEX + 1) % NUM_CHANNELS ))
-          echo "Next index will be $NEW_INDEX"
-          jq ".next_channel_index = $NEW_INDEX" $STATE_FILE > tmp.json && mv tmp.json $STATE_FILE
 
       - name: Run Python Forwarder Script
         env:
+          # --- بخش اصلاح شده ---
+          # این متغیرها اکنون به درستی از بخش "Variables" خوانده می‌شوند
+          SOURCE_CHANNELS_LIST: ${{ vars.SOURCE_CHANNELS_LIST }}
+          DESTINATION_CHANNELS_LIST: ${{ vars.DESTINATION_CHANNELS_LIST }}
+          # --------------------
+          # این سکرت‌ها همچنان از بخش "Secrets" خوانده می‌شوند
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           TELETHON_SESSION: ${{ secrets.TELETHON_SESSION }}
-          SOURCE_CHANNEL: ${{ env.SOURCE_CHANNEL }}
-          DESTINATION_CHANNEL: ${{ env.DESTINATION_CHANNEL }}
         run: python forwarder.py
 
       - name: Commit and Push State File
@@ -80,11 +57,7 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add forwarder_state.json
-          if git diff-index --quiet HEAD; then
-            echo "No changes to commit in state repo."
-          else
-            git commit -m "Update forwarder state"
-            git pull --rebase
-            git push
-          fi
+          # فقط در صورتی کامیت کن که تغییری وجود داشته باشد
+          git diff-index --quiet HEAD || git commit -m "Update forwarder state"
+          git push
 
