@@ -30,19 +30,9 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           path: state-repo
 
-      - name: Read state and select next channel
-        id: state_reader
-        run: |
-          # این مرحله اطمینان می‌دهد که فایل وضعیت وجود دارد
-          if [ ! -f "state-repo/forwarder_state.json" ]; then
-            echo '{"last_processed_index": -1}' > state-repo/forwarder_state.json
-          fi
-
       - name: Run Python Forwarder Script
         env:
-          # --- تغییر جدید: اضافه کردن متغیر زمان عدم فعالیت ---
           HOURS_OF_INACTIVITY: ${{ vars.HOURS_OF_INACTIVITY }}
-          # ---------------------------------------------------
           SOURCE_CHANNELS_LIST: ${{ vars.SOURCE_CHANNELS_LIST }}
           DESTINATION_CHANNELS_LIST: ${{ vars.DESTINATION_CHANNELS_LIST }}
           API_ID: ${{ secrets.API_ID }}
@@ -50,12 +40,20 @@ jobs:
           TELETHON_SESSION: ${{ secrets.TELETHON_SESSION }}
         run: python forwarder.py
 
+      # --- مرحله اصلاح شده برای پوش کردن فایل وضعیت ---
       - name: Commit and Push State File
         run: |
           cd state-repo
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add forwarder_state.json
-          git diff-index --quiet HEAD || git commit -m "Update forwarder state"
-          git push
+          # فقط در صورتی کامیت و پوش کن که تغییری وجود داشته باشد
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Update forwarder state"
+            # آدرس ریموت را با توکن بازنویسی می‌کنیم تا احراز هویت تضمین شود
+            git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ vars.STATE_REPO }}.git
+            git push
+          else
+            echo "No changes to commit in state repo."
+          fi
 
