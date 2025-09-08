@@ -36,28 +36,27 @@ def write_json_file(file_path, data):
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-async def clean_and_validate_message(message, source_channel_username):
-    """یک پیام را برای ارسال بررسی و پاک‌سازی می‌کند."""
-    # --- رفع باگ ---
-    # یک بررسی ایمنی اضافه شده تا از خطا در صورت None بودن متغیر جلوگیری شود
+async def clean_and_validate_caption(message, source_channel_username):
+    """
+    متن (کپشن) یک پیام را بررسی و پاک‌سازی می‌کند.
+    - اگر متن نامعتبر باشد (لینک یا منشن خارجی)، None برمی‌گرداند.
+    - اگر معتبر باشد، متن پاک‌سازی شده را برمی‌گرداند (می‌تواند رشته خالی باشد).
+    """
     if not source_channel_username:
-        logging.error("تابع clean_and_validate_message با یک نام کاربری کانال مبدأ نامعتبر فراخوانی شد.")
+        logging.error("نام کاربری کانال مبدأ نامعتبر است.")
         return None
 
     text = message.text
+    # اگر پیام اصلاً متنی نداشته باشد، معتبر است و یک رشته خالی برمی‌گردانیم
     if not text:
-        return None  # پیام‌های بدون متن را نادیده می‌گیریم
+        return ""
 
-    # ۱. نام کاربری کانال مبدأ را برای مقایسه تمیز می‌کنیم
     source_username_clean = source_channel_username.lstrip('@')
-
-    # ۲. بررسی وجود لینک در متن
     url_pattern = r'https?://\S+|www\.\S+|t\.me/\S+'
     if re.search(url_pattern, text):
         logging.warning(f"پست {message.id} حاوی لینک بود. از آن صرف‌نظر می‌شود.")
         return None
 
-    # ۳. بررسی منشن‌های خارجی
     mention_pattern = r'@(\w+)'
     mentions = re.findall(mention_pattern, text)
     for mention in mentions:
@@ -65,8 +64,6 @@ async def clean_and_validate_message(message, source_channel_username):
             logging.warning(f"پست {message.id} حاوی منشن خارجی @{mention} بود. از آن صرف‌نظر می‌شود.")
             return None
 
-    # ۴. پاک‌سازی متن نهایی: حذف آیدی کانال مبدأ
-    # از re.sub برای جایگزینی بدون توجه به حروف بزرگ و کوچک استفاده می‌کنیم
     cleaned_text = re.sub(r'@' + re.escape(source_username_clean), '', text, flags=re.IGNORECASE).strip()
     return cleaned_text
 
@@ -81,7 +78,6 @@ async def main():
         logging.error("لیست کانال‌های مبدأ یا مقصد به درستی تنظیم نشده‌اند.")
         sys.exit(1)
 
-    # تعیین اینکه کدام جفت کانال باید پردازش شود
     num_channels = len(source_channels)
     current_index = state_data.get('last_processed_index', -1)
     next_index = (current_index + 1) % num_channels
@@ -97,28 +93,43 @@ async def main():
         await client.connect()
         logging.info("کلاینت تلگرام با موفقیت متصل شد.")
 
-        # بررسی آخرین پیام در کانال مقصد
         last_message = await client.get_messages(destination_channel, limit=1)
         if last_message:
             last_post_time = last_message[0].date
             time_since_last_post = datetime.now(timezone.utc) - last_post_time
             if time_since_last_post < timedelta(hours=HOURS_OF_INACTIVITY):
                 logging.info(f"کانال {destination_channel} به تازگی فعال بوده است. نیازی به ارسال پست نیست.")
-                return  # خروج از برنامه
+                return
 
         logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال بررسی کانال مبدأ...")
 
-        # جستجو برای یک پست معتبر در کانال مبدأ
         async for message in client.iter_messages(source_channel, limit=10):
             if not message:
                 continue
 
-            cleaned_text = await clean_and_validate_message(message, source_channel)
-            if cleaned_text:
-                final_text = f"{cleaned_text}\n\n{destination_channel}"
+            # ۱. کپشن را اعتبارسنجی و پاک‌سازی کن
+            cleaned_caption = await clean_and_validate_caption(message, source_channel)
+
+            # اگر کپشن نامعتبر بود (مثلاً لینک داشت)، کل این پست را نادیده بگیر
+            if cleaned_caption is None:
+                continue
+
+            # ۲. بررسی کن که آیا چیزی برای ارسال وجود دارد (رسانه یا متن)
+            if not message.media and not cleaned_caption.strip():
+                continue # اگر نه رسانه بود و نه متن، به سراغ پیام بعدی برو
+
+            # ۳. متن نهایی را آماده کن
+            final_text = f"{cleaned_caption}\n\n{destination_channel}".strip()
+
+            # ۴. پست را ارسال کن
+            if message.media:
+                await client.send_file(destination_channel, message.media, caption=final_text)
+                logging.info(f"پست {message.id} (با رسانه) با موفقیت به {destination_channel} ارسال شد.")
+            else: # اگر فقط متن بود
                 await client.send_message(destination_channel, final_text)
-                logging.info(f"پست {message.id} با موفقیت به {destination_channel} ارسال شد.")
-                break  # پس از یافتن اولین پست معتبر، از حلقه خارج شو
+                logging.info(f"پست {message.id} (فقط متنی) با موفقیت به {destination_channel} ارسال شد.")
+
+            break # پس از ارسال موفق اولین پست معتبر، از حلقه خارج شو
         else:
             logging.warning(f"هیچ پست معتبری در ۱۰ پیام اخیر {source_channel} یافت نشد.")
 
@@ -128,7 +139,6 @@ async def main():
         if client.is_connected():
             await client.disconnect()
             logging.info("کلاینت تلگرام قطع شد.")
-        # به‌روزرسانی وضعیت برای اجرای بعدی
         state_data['last_processed_index'] = next_index
         write_json_file(STATE_FILE_PATH, state_data)
 
