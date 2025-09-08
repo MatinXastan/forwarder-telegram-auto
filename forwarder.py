@@ -4,18 +4,19 @@ import json
 import re
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.tl.types import Message
 import logging
 from datetime import datetime, timedelta, timezone
 import sys
+from typing import List, Optional
 
-# --- ۱. خواندن تنظیمات از متغیرهای محیطی ---
+# --- ۱. خواندن تنظیمات ---
 API_ID = int(os.environ.get('API_ID'))
 API_HASH = os.environ.get('API_HASH')
 TELETHON_SESSION = os.environ.get('TELETHON_SESSION')
 STATE_REPO_PATH = 'state-repo'
 STATE_FILE_PATH = os.path.join(STATE_REPO_PATH, "forwarder_state.json")
-# --- تغییر جدید: خواندن زمان عدم فعالیت از متغیرهای گیت‌هاب ---
+# اگر متغیر در گیت‌هاب تنظیم نشده باشد، از مقدار پیش‌فرض ۴ استفاده کن
 HOURS_OF_INACTIVITY = int(os.environ.get('HOURS_OF_INACTIVITY', 4))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,33 +38,49 @@ def write_json_file(file_path, data):
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-async def clean_and_validate_caption(message, source_channel_username):
-    """
-    متن (کپشن) یک پیام را بررسی و پاک‌سازی می‌کند.
-    """
-    if not source_channel_username:
-        logging.error("نام کاربری کانال مبدأ نامعتبر است.")
-        return None
-
-    text = message.text
+def is_caption_valid(text: Optional[str], source_channel_username: str) -> bool:
+    """بررسی می‌کند که آیا متن حاوی لینک یا منشن خارجی است یا نه."""
     if not text:
-        return ""
+        return True # متن خالی همیشه معتبر است
 
     source_username_clean = source_channel_username.lstrip('@')
     url_pattern = r'https?://\S+|www\.\S+|t\.me/\S+'
     if re.search(url_pattern, text):
-        logging.warning(f"پست {message.id} حاوی لینک بود. از آن صرف‌نظر می‌شود.")
-        return None
+        logging.warning(f"متن حاوی لینک بود. از آن صرف‌نظر می‌شود.")
+        return False
 
     mention_pattern = r'@(\w+)'
     mentions = re.findall(mention_pattern, text)
     for mention in mentions:
         if mention.lower() != source_username_clean.lower():
-            logging.warning(f"پست {message.id} حاوی منشن خارجی @{mention} بود. از آن صرف‌نظر می‌شود.")
-            return None
+            logging.warning(f"متن حاوی منشن خارجی @{mention} بود. از آن صرف‌نظر می‌شود.")
+            return False
+    return True
 
-    cleaned_text = re.sub(r'@' + re.escape(source_username_clean), '', text, flags=re.IGNORECASE).strip()
-    return cleaned_text
+def clean_caption(text: Optional[str], source_channel_username: str) -> str:
+    """آیدی کانال مبدأ را از متن پاک می‌کند."""
+    if not text:
+        return ""
+    source_username_clean = source_channel_username.lstrip('@')
+    return re.sub(r'@' + re.escape(source_username_clean), '', text, flags=re.IGNORECASE).strip()
+
+async def get_reply_quote(client: TelegramClient, message: Message, source_channel: str) -> str:
+    """در صورت ریپلای بودن، متن پیام اصلی را به صورت نقل‌قول برمی‌گرداند."""
+    if not message.reply_to_msg_id:
+        return ""
+    
+    try:
+        replied_to_msg = await client.get_messages(source_channel, ids=message.reply_to_msg_id)
+        if replied_to_msg and replied_to_msg.text:
+            # خلاصه‌ای از پیام اصلی را به عنوان نقل‌قول آماده کن
+            snippet = replied_to_msg.text.split('\n')[0]
+            if len(snippet) > 70:
+                snippet = snippet[:70] + "..."
+            return f"> {snippet}\n\n"
+    except Exception as e:
+        logging.warning(f"امکان دریافت پیام ریپلای شده وجود نداشت: {e}")
+    
+    return ""
 
 async def main():
     """منطق اصلی ربات."""
@@ -91,39 +108,61 @@ async def main():
         await client.connect()
         logging.info("کلاینت تلگرام با موفقیت متصل شد.")
 
-        last_message = await client.get_messages(destination_channel, limit=1)
-        if last_message:
-            last_post_time = last_message[0].date
-            time_since_last_post = datetime.now(timezone.utc) - last_post_time
-            if time_since_last_post < timedelta(hours=HOURS_OF_INACTIVITY):
-                logging.info(f"کانال {destination_channel} در {HOURS_OF_INACTIVITY} ساعت گذشته فعال بوده است. نیازی به ارسال پست نیست.")
+        last_messages = await client.get_messages(destination_channel, limit=1)
+        if last_messages:
+            last_post_time = last_messages[0].date
+            if (datetime.now(timezone.utc) - last_post_time) < timedelta(hours=HOURS_OF_INACTIVITY):
+                logging.info(f"کانال {destination_channel} به تازگی فعال بوده است. نیازی به ارسال پست نیست.")
                 return
 
         logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال بررسی کانال مبدأ...")
 
-        async for message in client.iter_messages(source_channel, limit=10):
-            if not message:
-                continue
+        messages: List[Message] = await client.get_messages(source_channel, limit=20)
+        processed_group_ids = set()
+        
+        for message in reversed(messages): # از پیام‌های قدیمی‌تر شروع می‌کنیم
+            if not message: continue
 
-            cleaned_caption = await clean_and_validate_caption(message, source_channel)
-            if cleaned_caption is None:
-                continue
+            # --- مدیریت آلبوم (پست‌های چندرسانه‌ای) ---
+            if message.grouped_id and message.grouped_id not in processed_group_ids:
+                album_messages = [m for m in messages if m.grouped_id == message.grouped_id]
+                album_media = [m.media for m in album_messages if m.media]
+                
+                # پیدا کردن کپشن در آلبوم
+                caption_message = next((m for m in album_messages if m.text), None)
+                caption_text = caption_message.text if caption_message else ""
 
-            if not message.media and not cleaned_caption.strip():
-                continue
+                if not is_caption_valid(caption_text, source_channel):
+                    processed_group_ids.add(message.grouped_id)
+                    continue
 
-            final_text = f"{cleaned_caption}\n\n{destination_channel}".strip()
+                cleaned_caption = clean_caption(caption_text, source_channel)
+                reply_quote = await get_reply_quote(client, caption_message or message, source_channel)
+                final_text = f"{reply_quote}{cleaned_caption}\n\n{destination_channel}".strip()
 
-            if message.media:
-                await client.send_file(destination_channel, message.media, caption=final_text)
-                logging.info(f"پست {message.id} (با رسانه) با موفقیت به {destination_channel} ارسال شد.")
-            else:
-                await client.send_message(destination_channel, final_text)
-                logging.info(f"پست {message.id} (فقط متنی) با موفقیت به {destination_channel} ارسال شد.")
+                await client.send_file(destination_channel, album_media, caption=final_text)
+                logging.info(f"آلبوم {message.grouped_id} با {len(album_media)} رسانه با موفقیت به {destination_channel} ارسال شد.")
+                processed_group_ids.add(message.grouped_id)
+                break # پس از ارسال موفق، از حلقه خارج شو
+            
+            # --- مدیریت پست‌های تکی ---
+            elif not message.grouped_id:
+                caption_text = message.text
+                if not is_caption_valid(caption_text, source_channel):
+                    continue
 
-            break
-        else:
-            logging.warning(f"هیچ پست معتبری در ۱۰ پیام اخیر {source_channel} یافت نشد.")
+                if not message.media and (not caption_text or not caption_text.strip()):
+                    continue # اگر نه رسانه بود و نه متن، رد شو
+
+                cleaned_caption = clean_caption(caption_text, source_channel)
+                reply_quote = await get_reply_quote(client, message, source_channel)
+                final_text = f"{reply_quote}{cleaned_caption}\n\n{destination_channel}".strip()
+                
+                await client.send_message(destination_channel, final_text, file=message.media)
+                logging.info(f"پست {message.id} با موفقیت به {destination_channel} ارسال شد.")
+                break
+        else: # اگر حلقه به طور طبیعی تمام شود (و break نشود)
+            logging.warning(f"هیچ پست معتبری در ۲۰ پیام اخیر {source_channel} یافت نشد.")
 
     except Exception as e:
         logging.error(f"یک خطای غیرمنتظره رخ داد: {e}", exc_info=True)
