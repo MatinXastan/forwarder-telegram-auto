@@ -40,12 +40,11 @@ jobs:
 
       - name: Run Python Forwarder Script
         env:
-          # --- بخش اصلاح شده ---
-          # این متغیرها اکنون به درستی از بخش "Variables" خوانده می‌شوند
+          # --- تغییر جدید: اضافه کردن متغیر زمان عدم فعالیت ---
+          HOURS_OF_INACTIVITY: ${{ vars.HOURS_OF_INACTIVITY }}
+          # ---------------------------------------------------
           SOURCE_CHANNELS_LIST: ${{ vars.SOURCE_CHANNELS_LIST }}
           DESTINATION_CHANNELS_LIST: ${{ vars.DESTINATION_CHANNELS_LIST }}
-          # --------------------
-          # این سکرت‌ها همچنان از بخش "Secrets" خوانده می‌شوند
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           TELETHON_SESSION: ${{ secrets.TELETHON_SESSION }}
@@ -57,7 +56,6 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add forwarder_state.json
-          # فقط در صورتی کامیت کن که تغییری وجود داشته باشد
           git diff-index --quiet HEAD || git commit -m "Update forwarder state"
           git push
 
