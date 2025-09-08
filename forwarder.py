@@ -15,7 +15,8 @@ API_HASH = os.environ.get('API_HASH')
 TELETHON_SESSION = os.environ.get('TELETHON_SESSION')
 STATE_REPO_PATH = 'state-repo'
 STATE_FILE_PATH = os.path.join(STATE_REPO_PATH, "forwarder_state.json")
-HOURS_OF_INACTIVITY = 4 # ساعت عدم فعالیت برای ارسال پست
+# --- تغییر جدید: خواندن زمان عدم فعالیت از متغیرهای گیت‌هاب ---
+HOURS_OF_INACTIVITY = int(os.environ.get('HOURS_OF_INACTIVITY', 4))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -39,15 +40,12 @@ def write_json_file(file_path, data):
 async def clean_and_validate_caption(message, source_channel_username):
     """
     متن (کپشن) یک پیام را بررسی و پاک‌سازی می‌کند.
-    - اگر متن نامعتبر باشد (لینک یا منشن خارجی)، None برمی‌گرداند.
-    - اگر معتبر باشد، متن پاک‌سازی شده را برمی‌گرداند (می‌تواند رشته خالی باشد).
     """
     if not source_channel_username:
         logging.error("نام کاربری کانال مبدأ نامعتبر است.")
         return None
 
     text = message.text
-    # اگر پیام اصلاً متنی نداشته باشد، معتبر است و یک رشته خالی برمی‌گردانیم
     if not text:
         return ""
 
@@ -98,7 +96,7 @@ async def main():
             last_post_time = last_message[0].date
             time_since_last_post = datetime.now(timezone.utc) - last_post_time
             if time_since_last_post < timedelta(hours=HOURS_OF_INACTIVITY):
-                logging.info(f"کانال {destination_channel} به تازگی فعال بوده است. نیازی به ارسال پست نیست.")
+                logging.info(f"کانال {destination_channel} در {HOURS_OF_INACTIVITY} ساعت گذشته فعال بوده است. نیازی به ارسال پست نیست.")
                 return
 
         logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال بررسی کانال مبدأ...")
@@ -107,29 +105,23 @@ async def main():
             if not message:
                 continue
 
-            # ۱. کپشن را اعتبارسنجی و پاک‌سازی کن
             cleaned_caption = await clean_and_validate_caption(message, source_channel)
-
-            # اگر کپشن نامعتبر بود (مثلاً لینک داشت)، کل این پست را نادیده بگیر
             if cleaned_caption is None:
                 continue
 
-            # ۲. بررسی کن که آیا چیزی برای ارسال وجود دارد (رسانه یا متن)
             if not message.media and not cleaned_caption.strip():
-                continue # اگر نه رسانه بود و نه متن، به سراغ پیام بعدی برو
+                continue
 
-            # ۳. متن نهایی را آماده کن
             final_text = f"{cleaned_caption}\n\n{destination_channel}".strip()
 
-            # ۴. پست را ارسال کن
             if message.media:
                 await client.send_file(destination_channel, message.media, caption=final_text)
                 logging.info(f"پست {message.id} (با رسانه) با موفقیت به {destination_channel} ارسال شد.")
-            else: # اگر فقط متن بود
+            else:
                 await client.send_message(destination_channel, final_text)
                 logging.info(f"پست {message.id} (فقط متنی) با موفقیت به {destination_channel} ارسال شد.")
 
-            break # پس از ارسال موفق اولین پست معتبر، از حلقه خارج شو
+            break
         else:
             logging.warning(f"هیچ پست معتبری در ۱۰ پیام اخیر {source_channel} یافت نشد.")
 
