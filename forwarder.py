@@ -127,6 +127,9 @@ async def main():
         await client.start()
         logging.info("کلاینت تلگرام با موفقیت متصل شد.")
 
+        # به طور پیش‌فرض فرض می‌کنیم که باید پستی ارسال شود
+        should_forward = True
+
         # ۱. بررسی فعالیت کانال مقصد
         last_message_list = await client.get_messages(destination_channel, limit=1)
         if last_message_list:
@@ -135,52 +138,51 @@ async def main():
             inactive_threshold = datetime.now(timezone.utc) - timedelta(hours=HOURS_OF_INACTIVITY)
             if last_post_time > inactive_threshold:
                 logging.info(f"کانال {destination_channel} به تازگی فعال بوده است. نیازی به ارسال پست نیست.")
-                return # در این حالت هم باید state به‌روز شود
-
-        logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال یافتن پست جدید از {source_channel}...")
-
-        # ۲. یافتن آخرین پست معتبر و ارسال نشده از کانال مبدأ
-        last_sent_id = state_data.get("last_sent_ids", {}).get(source_channel, 0)
+                should_forward = False
         
-        # پیام‌ها به ترتیب از جدید به قدیم دریافت می‌شوند
-        messages: List[Message] = await client.get_messages(source_channel, limit=50, min_id=last_sent_id)
-        
-        post_to_forward = None
-        # از بین پیام‌های جدید، جدیدترین پیام معتبر را پیدا می‌کنیم
-        for message in messages:
-            if not message or message.id <= last_sent_id:
-                continue
+        if should_forward:
+            logging.info(f"در {HOURS_OF_INACTIVITY} ساعت گذشته فعالیتی در {destination_channel} نبوده. در حال یافتن پست جدید از {source_channel}...")
 
-            caption_text = message.text if message.text else ""
-            if is_caption_valid(caption_text, source_channel):
-                post_to_forward = message
-                # چون پیام‌ها از جدید به قدیم هستند، اولین پیام معتبر، جدیدترین است
-                break
-        
-        if not post_to_forward:
-            logging.warning(f"هیچ پست معتبر و جدیدی در {source_channel} برای ارسال یافت نشد.")
-            return
+            # ۲. یافتن آخرین پست معتبر و ارسال نشده از کانال مبدأ
+            last_sent_id = state_data.get("last_sent_ids", {}).get(source_channel, 0)
+            logging.info(f"آخرین آیدی ارسال شده برای {source_channel} برابر است با: {last_sent_id}. در حال جستجوی پیام‌های جدیدتر...")
+            
+            messages: List[Message] = await client.get_messages(source_channel, limit=50, min_id=last_sent_id)
+            
+            post_to_forward = None
+            # از بین پیام‌های جدید، جدیدترین پیام معتبر را پیدا می‌کنیم
+            for message in messages:
+                if not message or message.id <= last_sent_id:
+                    continue
 
-        # ۳. ارسال پست یافت‌شده
-        logging.info(f"پست معتبر با آیدی {post_to_forward.id} از {source_channel} یافت شد. در حال ارسال...")
-        
-        cleaned_caption = clean_caption(post_to_forward.text, source_channel)
-        reply_quote = await get_reply_quote(client, post_to_forward, source_channel)
-        final_text = f"{reply_quote}{cleaned_caption}\n\n{destination_channel}".strip()
+                caption_text = message.text if message.text else ""
+                if is_caption_valid(caption_text, source_channel):
+                    post_to_forward = message
+                    break
+            
+            if post_to_forward:
+                # ۳. ارسال پست یافت‌شده
+                logging.info(f"پست معتبر با آیدی {post_to_forward.id} از {source_channel} یافت شد. در حال ارسال...")
+                
+                cleaned_caption = clean_caption(post_to_forward.text, source_channel)
+                reply_quote = await get_reply_quote(client, post_to_forward, source_channel)
+                final_text = f"{reply_quote}{cleaned_caption}\n\n{destination_channel}".strip()
 
-        # مدیریت آلبوم‌ها
-        if post_to_forward.grouped_id:
-            album_messages_iter = client.iter_messages(source_channel, limit=20)
-            album_messages = [m async for m in album_messages_iter if m.grouped_id == post_to_forward.grouped_id]
-            album_media = [m.media for m in sorted(album_messages, key=lambda m: m.id) if m.media]
-            await client.send_file(destination_channel, album_media, caption=final_text)
-            logging.info(f"آلبوم {post_to_forward.grouped_id} با موفقیت به {destination_channel} ارسال شد.")
-        else: # پست‌های تکی
-            await client.send_message(destination_channel, final_text, file=post_to_forward.media)
-            logging.info(f"پست {post_to_forward.id} با موفقیت به {destination_channel} ارسال شد.")
-        
-        # ۴. به‌روزرسانی state با آیدی پست ارسال‌شده
-        state_data["last_sent_ids"][source_channel] = post_to_forward.id
+                # مدیریت آلبوم‌ها
+                if post_to_forward.grouped_id:
+                    album_messages_iter = client.iter_messages(source_channel, limit=20)
+                    album_messages = [m async for m in album_messages_iter if m.grouped_id == post_to_forward.grouped_id]
+                    album_media = [m.media for m in sorted(album_messages, key=lambda m: m.id) if m.media]
+                    await client.send_file(destination_channel, album_media, caption=final_text)
+                    logging.info(f"آلبوم {post_to_forward.grouped_id} با موفقیت به {destination_channel} ارسال شد.")
+                else: # پست‌های تکی
+                    await client.send_message(destination_channel, final_text, file=post_to_forward.media)
+                    logging.info(f"پست {post_to_forward.id} با موفقیت به {destination_channel} ارسال شد.")
+                
+                # ۴. به‌روزرسانی state با آیدی پست ارسال‌شده
+                state_data["last_sent_ids"][source_channel] = post_to_forward.id
+            else:
+                logging.warning(f"هیچ پست معتبر و جدیدی در {source_channel} برای ارسال یافت نشد.")
 
     except Exception as e:
         logging.error(f"یک خطای غیرمنتظره رخ داد: {e}", exc_info=True)
